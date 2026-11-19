@@ -3,10 +3,13 @@
 voicetype — push-to-talk dictation from the Atech Tiny voice stick.
 
 Hold the stick's button and talk. Each phrase is typed wherever your cursor is
-as soon as you pause (X11, via xdotool) — you don't have to let go first.
-Transcription runs locally with faster-whisper.
+as soon as you pause — you don't have to let go first. Typing uses xdotool on
+Linux (X11) and the clipboard + System Events on macOS.
+Transcription runs locally: faster-whisper, or mlx-whisper on Apple Silicon.
 
     host/.venv/bin/python host/voicetype.py                   # default: base.en, live
+                                                              # (Apple Silicon: large-v3-turbo, any language)
+    host/.venv/bin/python host/voicetype.py --language it     # force a language
     host/.venv/bin/python host/voicetype.py --model small.en  # more accurate, ~3x slower
     host/.venv/bin/python host/voicetype.py --enter           # press Enter on release
                                                               # (or tap the button: Enter / Tab)
@@ -20,6 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import queue
 import shutil
 import struct
@@ -43,6 +47,10 @@ PACKET_TYPES = b"SDEANT"
 STALL_SECONDS = 3.0  # a recording with no packets this long is finalized anyway
 
 CLEAR_LINES = 6  # Ctrl+U presses when clearing a prompt; each clears one line
+
+IS_MAC = sys.platform == "darwin"
+APPLE_SILICON = IS_MAC and platform.machine() == "arm64"
+MLX_DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 
 DEFAULT_PROMPT = (
     "Dictation for a coding assistant in a terminal. Claude, Claude Code, git, "
@@ -109,13 +117,14 @@ def _log_junk(b: bytes) -> None:
 
 # -------------------------------------------------------------- transcription
 class LocalWhisper:
-    def __init__(self, model: str, prompt: str | None, threads: int):
+    def __init__(self, model: str, prompt: str | None, threads: int, language: str | None = "en"):
         from faster_whisper import WhisperModel
 
         log.info("loading whisper model %r (first run downloads it)...", model)
         t0 = time.time()
         self.model = WhisperModel(model, device="cpu", compute_type="int8", cpu_threads=threads)
         self.prompt = prompt
+        self.language = language
         log.info("model ready in %.1fs", time.time() - t0)
 
     def transcribe(self, audio: np.ndarray, context: str = "") -> str:
@@ -124,13 +133,42 @@ class LocalWhisper:
         prompt = " ".join(p for p in (self.prompt, context[-200:]) if p) or None
         segments, _info = self.model.transcribe(
             audio,
-            language="en",
+            language=self.language,
             beam_size=5,
             vad_filter=True,
             condition_on_previous_text=False,
             initial_prompt=prompt,
         )
         return " ".join(s.text.strip() for s in segments).strip()
+
+
+class MLXWhisper:
+    """Whisper on the Apple Silicon GPU (mlx-whisper). Fast enough for
+    large-v3-turbo, which is multilingual and more accurate than base.en."""
+
+    def __init__(self, model: str, prompt: str | None, language: str | None):
+        import mlx_whisper
+
+        self._mlx = mlx_whisper
+        self.model = model
+        self.prompt = prompt
+        self.language = language
+        log.info("loading mlx-whisper model %r (first run downloads it)...", model)
+        t0 = time.time()
+        self.transcribe(np.zeros(SAMPLE_RATE // 2, dtype=np.float32))   # load + warm up
+        log.info("model ready in %.1fs", time.time() - t0)
+
+    def transcribe(self, audio: np.ndarray, context: str = "") -> str:
+        prompt = " ".join(p for p in (self.prompt, context[-200:]) if p) or None
+        out = self._mlx.transcribe(
+            audio,
+            path_or_hf_repo=self.model,
+            language=self.language,
+            condition_on_previous_text=False,
+            initial_prompt=prompt,
+            verbose=None,
+        )
+        return out["text"].strip()
 
 
 def prepare_audio(pcm: bytes) -> np.ndarray:
@@ -157,7 +195,10 @@ def vad_audio(pcm: bytes) -> np.ndarray:
 
 
 # Whisper's well-known outputs for near-silence.
-HALLUCINATIONS = {"", "you", "thank you", "thanks for watching", "thank you for watching", "bye"}
+HALLUCINATIONS = {"", "you", "thank you", "thanks for watching", "thank you for watching", "bye",
+                  # Italian ones, now that the multilingual model is an option
+                  "grazie", "grazie a tutti", "grazie per la visione",
+                  "sottotitoli creati dalla comunità amara.org", "sottotitoli a cura di qtss"}
 
 
 def is_hallucination(text: str) -> bool:
@@ -225,12 +266,47 @@ class PhraseSplitter:
 
 # ---------------------------------------------------------------------- typing
 def type_text(text: str) -> None:
+    if IS_MAC:
+        _mac_paste(text)
+        return
     subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "4", "--", text], check=True)
 
 
 def press_key(key: str, repeat: int = 1) -> None:
+    if IS_MAC:
+        _mac_key(key, repeat)
+        return
     subprocess.run(["xdotool", "key", "--clearmodifiers", "--repeat", str(repeat), "--repeat-delay", "2", key],
                    check=True)
+
+
+# macOS: System Events does the keystrokes. The terminal (or the Python that
+# runs eve) needs Privacy & Security > Accessibility, or nothing gets typed.
+MAC_KEY_CODES = {"Return": 36, "Tab": 48, "BackSpace": 51}
+
+
+def _osascript(script: str) -> None:
+    subprocess.run(["osascript", "-e", script], check=True, capture_output=True)
+
+
+def _mac_paste(text: str) -> None:
+    """Paste through the clipboard: unlike keystroke-typing, it handles accents
+    and emoji and is instant. The previous (text) clipboard is put back."""
+    old = subprocess.run(["pbpaste"], capture_output=True).stdout
+    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+    _osascript('tell application "System Events" to keystroke "v" using command down')
+    time.sleep(0.15)   # let the app read the clipboard before restoring it
+    subprocess.run(["pbcopy"], input=old)
+
+
+def _mac_key(key: str, repeat: int) -> None:
+    if key in MAC_KEY_CODES:
+        action = f"key code {MAC_KEY_CODES[key]}"
+    elif key.startswith("ctrl+") and len(key) == 6:
+        action = f'keystroke "{key[-1]}" using control down'
+    else:
+        raise ValueError(f"no macOS mapping for key {key!r}")
+    _osascript(f'tell application "System Events"\nrepeat {int(repeat)} times\n{action}\nend repeat\nend tell')
 
 
 # ------------------------------------------------------------------------ main
@@ -245,7 +321,11 @@ class Job:
 class App:
     def __init__(self, args):
         self.args = args
-        self.engine = LocalWhisper(args.model, None if args.no_prompt else args.prompt, args.threads)
+        prompt = None if args.no_prompt else args.prompt
+        if args.engine == "mlx":
+            self.engine = MLXWhisper(args.model, prompt, args.language)
+        else:
+            self.engine = LocalWhisper(args.model, prompt, args.threads, args.language)
         self.splitter = None if args.no_live else PhraseSplitter(args.pause)
         self.jobs: queue.Queue[Job] = queue.Queue()
         self._carry: Job | None = None
@@ -473,8 +553,15 @@ def save_wav(path: str, pcm: bytes) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default=os.environ.get("VOICETYPE_MODEL", "base.en"),
-                    help="faster-whisper model: tiny.en, base.en (default), small.en (more accurate, ~3x slower), medium.en")
+    ap.add_argument("--engine", choices=("auto", "faster", "mlx"), default="auto",
+                    help="speech engine: mlx (Apple Silicon GPU), faster (faster-whisper, CPU). "
+                         "auto = mlx on Apple Silicon if installed, else faster")
+    ap.add_argument("--model", default=os.environ.get("VOICETYPE_MODEL"),
+                    help="faster: tiny.en, base.en (default), small.en (more accurate, ~3x slower), medium.en, "
+                         "or a multilingual one like small. mlx: a Hugging Face repo, default "
+                         + MLX_DEFAULT_MODEL)
+    ap.add_argument("--language", default=os.environ.get("VOICETYPE_LANGUAGE", "auto"),
+                    help="spoken language code (en, it, ...) or auto (default). *.en models are English only")
     ap.add_argument("--port", help="serial device (default: auto-detect the ESP32-S3)")
     ap.add_argument("--enter", action="store_true", help="press Enter when you release the button (sends it to Claude)")
     ap.add_argument("--no-live", action="store_true", help="type everything at once on release instead of phrase by phrase")
@@ -494,10 +581,32 @@ def main() -> None:
     for noisy in ("httpx", "huggingface_hub", "faster_whisper"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    if not args.dry_run and not shutil.which("xdotool"):
-        sys.exit("xdotool is not installed: sudo apt install xdotool")
-    if not os.environ.get("DISPLAY") and not args.dry_run:
-        sys.exit("DISPLAY is not set — run this inside your X11 session")
+    if args.engine == "auto":
+        try:
+            if not APPLE_SILICON:
+                raise ImportError
+            import mlx_whisper  # noqa: F401
+            args.engine = "mlx"
+        except ImportError:
+            args.engine = "faster"
+    if not args.model:
+        args.model = MLX_DEFAULT_MODEL if args.engine == "mlx" else "base.en"
+    if args.model.endswith(".en"):
+        args.language = "en"
+    elif args.language == "auto":
+        args.language = None
+    log.info("engine %s, model %s, language %s", args.engine, args.model, args.language or "auto")
+
+    if args.dry_run:
+        pass
+    elif IS_MAC:
+        log.info("macOS: if nothing gets typed, allow this terminal in "
+                 "System Settings > Privacy & Security > Accessibility")
+    else:
+        if not shutil.which("xdotool"):
+            sys.exit("xdotool is not installed: sudo apt install xdotool")
+        if not os.environ.get("DISPLAY"):
+            sys.exit("DISPLAY is not set — run this inside your X11 session")
 
     try:
         App(args).run()

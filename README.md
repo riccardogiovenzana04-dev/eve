@@ -87,9 +87,66 @@ The button light shows what's happening:
 | violet flash | double-tap (delete) |
 | red flash | something went wrong (see the log) |
 
+## Alternative build: XIAO ESP32S3 Sense + macOS
+
+The same stick without Atech modules. It uses one small off-the-shelf board,
+a 12 mm button and a 3D-printed case. The firmware in `firmware-xiao/` speaks
+the same USB protocol, so `host/voicetype.py` works with either stick.
+
+| Part | Notes |
+|---|---|
+| **Seeed Studio XIAO ESP32S3 Sense** | Not the "Pre-Soldered" version: its pins don't fit the case. The mic is on the Sense add-on board, so keep that clipped on. |
+| **12×12×7.3 mm tactile button** with cap | Solder one leg to **D1**, the diagonally opposite leg to **GND**. |
+| 28 AWG silicone wire, solder, soldering iron | Two joints in total. |
+| 3D-printed case | `hardware/xiao-case/eve_plate.stl`: PLA, 0.2 mm layers, no supports. |
+
+**The light is the board's single orange LED**, so the colours become patterns:
+
+| Light | Meaning |
+|---|---|
+| 3 blinks at power-up | firmware booted |
+| **solid** | listening |
+| **fast blink** | finishing the last phrase |
+| one long blink | typed |
+| one short blink | tap (Enter or Tab) |
+| two short blinks | double-tap (delete) |
+| five rapid blinks | something went wrong (see the log) |
+
+### Flash the XIAO
+
+You only need [PlatformIO](https://platformio.org), no Atech library:
+
+```bash
+cd firmware-xiao
+pio run -e xiao-boot -t upload   # first test: uses the board's BOOT button, no soldering
+pio run -e xiao -t upload        # once the 12 mm button is wired to D1
+```
+
+If the upload fails, hold **BOOT**, tap **RESET**, release BOOT, and try again.
+
+### Run it on a Mac
+
+```bash
+python3 -m venv host/.venv
+host/.venv/bin/pip install -r host/requirements.txt
+host/.venv/bin/python host/voicetype.py              # add --language it to force Italian
+```
+
+- On Apple Silicon, transcription runs on the Mac's GPU with
+  [mlx-whisper](https://github.com/ml-explore/mlx-examples) and
+  **large-v3-turbo**, a multilingual model that detects the language itself.
+  The first run downloads it once (~1.6 GB). Use `--engine faster` for the
+  original faster-whisper engine.
+- Typing uses the clipboard and System Events, so accents and emoji work. Allow
+  your terminal in **System Settings → Privacy & Security → Accessibility**,
+  or nothing gets typed.
+- To start eve at every login: `host/install-autostart-macos.sh` (add flags
+  after it, e.g. `--language it`). It prints the Python path to allow under
+  Accessibility, and logs to `~/Library/Logs/voicetype.log`.
+
 ## Setup
 
-Tested on Linux with X11. Typing uses `xdotool`, which doesn't work on Wayland.
+The steps below are for the Atech stick on Linux, tested with X11. Typing there uses `xdotool`, which doesn't work on Wayland.
 
 ### 1. Flash the stick
 
@@ -134,6 +191,8 @@ It logs to `~/.cache/voicetype.log`.
 | Flag | What it does |
 |---|---|
 | `--model small.en` | more accurate on technical words, about 3× slower than the default `base.en` |
+| `--language it` | force a spoken language (default: auto-detect; `*.en` models are English only) |
+| `--engine faster` | use faster-whisper even on Apple Silicon (default there: mlx-whisper, large-v3-turbo) |
 | `--pause 0.6` | how long a pause (seconds) ends a phrase. Default `0.4` |
 | `--enter` | also press Enter every time you let go |
 | `--no-live` | type everything at once when you let go |
@@ -166,12 +225,15 @@ low battery or a weak charger. Stay on `base.en`, or try `--model tiny.en`.
 ## Project layout
 
 ```
-firmware/            PlatformIO project for the stick (ESP32-S3, Arduino)
+firmware/            PlatformIO project for the Atech stick (ESP32-S3, Arduino)
   src/main.cpp       recording, button gestures, USB wire protocol
   diag/diag.cpp      microphone wiring diagnostic
+firmware-xiao/       the same firmware for the XIAO ESP32S3 Sense (no Atech library)
 host/
-  voicetype.py       desktop app: VAD phrase splitting, Whisper, typing
-  install-autostart.sh
+  voicetype.py       desktop app: VAD phrase splitting, Whisper, typing (Linux + macOS)
+  install-autostart.sh         start at login (Linux)
+  install-autostart-macos.sh   start at login (macOS LaunchAgent)
+hardware/xiao-case/  3D-printable case for the XIAO build (make_stl.py + STLs)
 assets/logo.svg
 ```
 

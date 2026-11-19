@@ -2,3 +2,4 @@ host/.venv/
 __pycache__/
 firmware/.pio/
 *.wav
+firmware-xiao/.pio/
